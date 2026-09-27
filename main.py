@@ -7,8 +7,203 @@ import tkinter as tk
 # ttk = themed widgets (Frame, Label, Button, Scrollbar).
 from tkinter import ttk
 
+# Standard library modules for network discovery, threading, and system commands
+import concurrent.futures
+import platform
+import re
+import socket
+import subprocess
+import threading
+import uuid
+
 # Text shown at the start of each new input line (like a real console prompt).
 PROMPT = "> "
+
+
+# ---------------------------------------------------------------------------
+# NETWORK SCANNER CLASS
+# ---------------------------------------------------------------------------
+class NetworkScanner:
+    """
+    Detects the current local network interface and scans the network
+    for active connected devices, retrieving their IP, MAC address,
+    and device/hostname.
+    """
+
+    def get_current_network(self) -> dict:
+        """
+        Detect the current active network configuration:
+          - Local IP address
+          - Subnet prefix (e.g. 192.168.1)
+          - Subnet CIDR (e.g. 192.168.1.0/24)
+          - Wi-Fi SSID / Network label
+        """
+        # Connect a UDP socket to an external address to find default outgoing interface.
+        # Note: No actual network packets are sent, this queries the OS routing table.
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+        except Exception:
+            try:
+                local_ip = socket.gethostbyname(socket.gethostname())
+            except Exception:
+                local_ip = "127.0.0.1"
+        finally:
+            s.close()
+
+        # Query Wi-Fi SSID if running on Windows
+        ssid = None
+        if platform.system() == "Windows":
+            try:
+                out = subprocess.run(
+                    ["netsh", "wlan", "show", "interfaces"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                ).stdout
+                match = re.search(r"^\s*SSID\s*:\s*(.+)$", out, re.MULTILINE)
+                if match:
+                    ssid = match.group(1).strip()
+            except Exception:
+                pass
+
+        # Calculate /24 subnet prefix
+        ip_parts = local_ip.split(".")
+        if len(ip_parts) == 4:
+            subnet_prefix = ".".join(ip_parts[:3])
+        else:
+            subnet_prefix = "127.0.0"
+
+        subnet = f"{subnet_prefix}.0/24"
+        network_name = f"{ssid} ({subnet})" if ssid else f"Local Network ({subnet})"
+
+        return {
+            "local_ip": local_ip,
+            "subnet_prefix": subnet_prefix,
+            "subnet": subnet,
+            "network_name": network_name,
+        }
+
+    def get_local_mac(self) -> str:
+        """
+        Retrieve the MAC address of the local machine.
+        Tries wireless interface first on Windows, falls back to uuid.getnode().
+        """
+        if platform.system() == "Windows":
+            try:
+                out = subprocess.run(
+                    ["netsh", "wlan", "show", "interfaces"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                ).stdout
+                match = re.search(r"Physical address\s*:\s*([0-9a-fA-F:-]{17})", out)
+                if match:
+                    return match.group(1).replace(":", "-").lower()
+            except Exception:
+                pass
+
+        # Fallback using uuid.getnode()
+        mac_num = uuid.getnode()
+        return "-".join(f"{(mac_num >> (i * 8)) & 0xff:02x}" for i in reversed(range(6)))
+
+    def scan_and_format(self) -> str:
+        """
+        Performs the complete network scan:
+          1. Detects current network and local IP.
+          2. Runs a fast parallel ping sweep to wake up devices and populate the ARP table.
+          3. Parses the system ARP cache ('arp -a') for active IP and MAC addresses.
+          4. Resolves hostnames concurrently with reverse DNS lookups.
+          5. Returns a formatted summary table string ready for display in the console.
+        """
+        net_info = self.get_current_network()
+        local_ip = net_info["local_ip"]
+        subnet_prefix = net_info["subnet_prefix"]
+
+        if local_ip.startswith("127."):
+            return "Unable to scan: No active network connection detected (loopback IP)."
+
+        # Fast parallel ping sweep to populate the OS ARP cache
+        def ping_ip(ip: str) -> None:
+            cmd = (
+                ["ping", "-n", "1", "-w", "100", ip]
+                if platform.system() == "Windows"
+                else ["ping", "-c", "1", "-W", "1", ip]
+            )
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # 80 concurrent workers allows 254 IPs to be checked in ~2-3 seconds
+        with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
+            list(executor.map(ping_ip, [f"{subnet_prefix}.{i}" for i in range(1, 255)]))
+
+        # Query the system ARP cache table
+        device_dict: dict[str, str] = {}  # ip -> mac address
+        try:
+            arp_res = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+            for line in arp_res.stdout.splitlines():
+                ip_match = re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", line)
+                mac_match = re.search(r"(?:[0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}", line)
+
+                if ip_match and mac_match:
+                    ip = ip_match.group()
+                    mac = mac_match.group().replace(":", "-").lower()
+
+                    # Filter out broadcasts, multicasts, and foreign interfaces
+                    if (
+                        ip.startswith(subnet_prefix)
+                        and not ip.endswith(".255")
+                        and not (ip.startswith("224.") or ip.startswith("239."))
+                        and mac != "ff-ff-ff-ff-ff-ff"
+                    ):
+                        device_dict[ip] = mac
+        except Exception as e:
+            return f"Error reading system ARP table: {e}"
+
+        # Include local machine in device list
+        local_mac = self.get_local_mac()
+        device_dict[local_ip] = local_mac
+
+        # Concurrent reverse DNS lookup to get device names
+        def resolve_name(ip: str) -> tuple[str, str]:
+            if ip == local_ip:
+                return ip, f"{socket.gethostname()} (This Device)"
+            socket.setdefaulttimeout(0.3)
+            try:
+                name = socket.gethostbyaddr(ip)[0]
+                return ip, name
+            except Exception:
+                return ip, "Unknown Device"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
+            names = dict(executor.map(resolve_name, device_dict.keys()))
+
+        # Format results into a clear console display
+        lines = [
+            "=" * 68,
+            "NETWORK SCAN RESULTS",
+            f"Current Network : {net_info['network_name']}",
+            f"Local Host IP   : {local_ip}",
+            f"Devices Found   : {len(device_dict)}",
+            "-" * 68,
+            "%-17s %-19s %s" % ("IP ADDRESS", "MAC ADDRESS", "DEVICE NAME"),
+            "-" * 68,
+        ]
+
+        # Sort IP addresses in numerical order
+        def ip_sort_key(ip_str: str) -> list[int]:
+            try:
+                return [int(part) for part in ip_str.split(".")]
+            except Exception:
+                return [0, 0, 0, 0]
+
+        for ip in sorted(device_dict.keys(), key=ip_sort_key):
+            mac = device_dict[ip]
+            name = names.get(ip, "Unknown Device")
+            lines.append("%-17s %-19s %s" % (ip, mac, name))
+
+        lines.append("=" * 68)
+        return "\n".join(lines)
 
 
 def main() -> None:
@@ -105,6 +300,10 @@ def main() -> None:
         # Wipe line 1 if it already has text, then write a clean prompt.
         console.delete("1.0", "1.end")
         console.insert("1.0", PROMPT)                       # "> " at the very top
+        # Ensure a newline exists after the prompt (like pressing Enter)
+        # so output printed at line 2 doesn't attach to the prompt line.
+        if console.compare("end-1c", "==", "1.end"):
+            console.insert("1.end", "\n")
         console.mark_set("input_start", f"1.0 + {len(PROMPT)}c")  # after "> "
         console.mark_set(tk.INSERT, "input_start")          # blinking cursor after "> "
         console.see("1.0")                                  # stay scrolled to the TOP
@@ -217,11 +416,32 @@ def main() -> None:
 
         return None
 
+    def scan_and_display_network() -> None:
+        """
+        Background worker that runs the network scanner, detects the current network,
+        discovers all connected devices (IP, MAC, Hostname), and displays the results
+        in the console.
+        """
+        scanner = NetworkScanner()
+        results = scanner.scan_and_format()
+
+        # Safely insert the results into the Tkinter console from the main GUI thread
+        root.after(0, lambda: console_print(results))
+        root.after(0, lambda: console.mark_set(tk.INSERT, "1.end"))
+        root.after(0, lambda: console.focus_set())
+
     def on_button1() -> None:
-        """Button 1 click -> print a message into the console."""
-        console_print("Button 1 pressed")
+        """
+        Button 1 click -> detect current network and scan for connected devices.
+
+        Runs the network scan in a background thread so the Tkinter GUI remains responsive.
+        """
+        console_print("Scanning network for connected devices... Please wait a moment.")
         console.mark_set(tk.INSERT, "1.end")  # keep the cursor on the top input line
         console.focus_set()
+
+        # Run scanner in a background thread to prevent GUI freezing
+        threading.Thread(target=scan_and_display_network, daemon=True).start()
 
     def on_button2() -> None:
         """Button 2 click -> print a message into the console."""
@@ -293,7 +513,7 @@ def main() -> None:
     # command= is the function called when the button is clicked (no arguments).
     ttk.Button(
         button_frame,
-        text="Button 1",
+        text="Scan Network",
         width=12,
         command=on_button1,                 # click -> on_button1() -> console_print(...)
     ).pack(pady=(0, 8), fill=tk.X)
@@ -315,10 +535,13 @@ def main() -> None:
     # -----------------------------------------------------------------------
     # Prompt first (line 1 at the TOP), then messages under it (latest near top).
     show_prompt()                           # show "> " on line 1 and put the cursor after it
+    # Press Enter (newline) after "> " so line 1 is only "> " and output starts on line 2
+    if console.compare("end-1c", "==", "1.end"):
+        console.insert("1.end", "\n")
     console_print("Console ready. Type here and press Enter.")
     console_print("Try: help  |  loop 20  |  clear")
     console_print("Or click Button 1 / Button 2.")
-    console.mark_set(tk.INSERT, "1.end")    # cursor stays on the top input line
+    console.mark_set(tk.INSERT, "input_start")  # cursor starts fresh right after "> "
 
     console.focus_set()                     # keyboard focus goes straight into the console
 
