@@ -9,12 +9,19 @@ from tkinter import ttk
 
 # Standard library modules for network discovery, threading, and system commands
 import concurrent.futures
+import multiprocessing
 import platform
 import re
 import socket
 import subprocess
 import threading
 import uuid
+
+# Note: Subprocess creation flag to suppress flashing black console windows on Windows.
+# When packaged as a windowed .exe (console=False), calling subprocesses without this flag
+# causes Windows to rapidly spawn and destroy console windows for every ping/command,
+# appearing to the user as an aggressive, uncontrollable popup loop.
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 
 # Text shown at the start of each new input line (like a real console prompt).
 PROMPT = "> "
@@ -61,6 +68,7 @@ class NetworkScanner:
                     capture_output=True,
                     text=True,
                     timeout=2,
+                    creationflags=NO_WINDOW,  # Note: Suppress console window in .exe
                 ).stdout
                 match = re.search(r"^\s*SSID\s*:\s*(.+)$", out, re.MULTILINE)
                 if match:
@@ -97,6 +105,7 @@ class NetworkScanner:
                     capture_output=True,
                     text=True,
                     timeout=2,
+                    creationflags=NO_WINDOW,  # Note: Suppress console window in .exe
                 ).stdout
                 match = re.search(r"Physical address\s*:\s*([0-9a-fA-F:-]{17})", out)
                 if match:
@@ -131,7 +140,15 @@ class NetworkScanner:
                 if platform.system() == "Windows"
                 else ["ping", "-c", "1", "-W", "1", ip]
             )
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            # Note: creationflags=NO_WINDOW is critical here. Without it, running as a windowed .exe
+            # will trigger Windows to spawn and destroy a new console window for each of the 254
+            # pings across 80 threads, resulting in an overwhelming rapid-fire window flashing loop.
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
+            )
 
         # 80 concurrent workers allows 254 IPs to be checked in ~2-3 seconds
         with concurrent.futures.ThreadPoolExecutor(max_workers=80) as executor:
@@ -140,7 +157,12 @@ class NetworkScanner:
         # Query the system ARP cache table
         device_dict: dict[str, str] = {}  # ip -> mac address
         try:
-            arp_res = subprocess.run(["arp", "-a"], capture_output=True, text=True)
+            arp_res = subprocess.run(
+                ["arp", "-a"],
+                capture_output=True,
+                text=True,
+                creationflags=NO_WINDOW,  # Note: Suppress console window in .exe
+            )
             for line in arp_res.stdout.splitlines():
                 ip_match = re.search(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b", line)
                 mac_match = re.search(r"(?:[0-9a-fA-F]{1,2}[:-]){5}[0-9a-fA-F]{1,2}", line)
@@ -168,13 +190,13 @@ class NetworkScanner:
         def resolve_name(ip: str) -> tuple[str, str]:
             if ip == local_ip:
                 return ip, f"{socket.gethostname()} (This Device)"
-            socket.setdefaulttimeout(0.3)
             try:
                 name = socket.gethostbyaddr(ip)[0]
                 return ip, name
             except Exception:
                 return ip, "Unknown Device"
 
+        socket.setdefaulttimeout(0.3)
         with concurrent.futures.ThreadPoolExecutor(max_workers=25) as executor:
             names = dict(executor.map(resolve_name, device_dict.keys()))
 
@@ -554,4 +576,10 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 # Run main() only when this file is executed directly (not when imported).
 if __name__ == "__main__":
+    # Note: freeze_support() is strictly required when freezing Python programs
+    # with PyInstaller on Windows. Without this call, child worker or helper
+    # processes (e.g. from concurrent/multiprocessing runtimes) do not recognize
+    # that they are sub-processes and instead re-execute the entire script from the
+    # top, causing an uncontrollable infinite recursive process-spawning loop.
+    multiprocessing.freeze_support()
     main()
